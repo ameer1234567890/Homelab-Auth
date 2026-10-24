@@ -22,6 +22,7 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}   # set true once served over HTTPS
       SESSION_HOURS: ${SESSION_HOURS:-168}
       TRUST_PROXY: ${TRUST_PROXY:-false}       # true if another reverse proxy sits in front of this
+      AUDIT_MAX_ROWS: ${AUDIT_MAX_ROWS:-50000} # audit log entries to keep
       # Only needed for the optional forward-auth mode (see README):
       PUBLIC_URL: ${PUBLIC_URL:-}
       COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}

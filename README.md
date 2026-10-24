@@ -47,10 +47,20 @@ multiple `Set-Cookie`, and rewriting of absolute redirects that point at the ups
 | `COOKIE_SECURE` | `false` | `true` when served over HTTPS |
 | `TRUST_PROXY` | `false` | `true` if another proxy (Caddy/Traefik/NPM) is in front of this container |
 | `SESSION_HOURS` | `168` | Session lifetime |
+| `AUDIT_MAX_ROWS` | `50000` | Audit entries kept; the oldest are pruned beyond this |
 | `PUBLIC_URL`, `COOKIE_DOMAIN` | empty | Only for forward-auth mode below |
 
 If you put TLS termination in front (recommended for anything beyond your LAN), point it at
 this container's port 8080, set `COOKIE_SECURE=true` and `TRUST_PROXY=true`.
+
+## Audit log
+Admins get an **Audit log** card at `/_auth/` (stored in the same SQLite file). It records time, event, user,
+target, IP address and details for: successful and failed sign-ins (with the reason: unknown user / wrong
+password / account disabled), lockouts, sign-outs, password changes, and user create / update / delete
+(which fields changed, never the values or passwords). Filter by event type, search by IP/user/details,
+and page through entries. **Clear logs** wipes the table; the clearing itself is logged as the first new entry.
+Failed logins are also written to the container log (`docker compose logs auth`).
+Behind another reverse proxy, set `TRUST_PROXY=true` so the real client IP is recorded.
 
 ## Dark mode
 The theme switch is remembered in the browser (localStorage + a 1-year cookie, so the login

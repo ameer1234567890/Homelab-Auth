@@ -1,6 +1,7 @@
 'use strict';
 const root = document.getElementById('app');
-const state = { me: null, users: [], q: '', gateway: false };
+const state = { me: null, users: [], q: '', gateway: false,
+  audit: { filter: '', q: '', offset: 0, limit: 25, total: 0, entries: [] } };
 const API = '/_auth/api';
 // When served at any URL outside /_auth/, we are the login gate in front of the proxied app.
 const GATE = !location.pathname.startsWith('/_auth');
@@ -92,6 +93,7 @@ function openDialog({ title, fields, submit, danger, onSubmit }) {
 }
 
 const initial = u => (u.display_name || u.username).trim().charAt(0).toUpperCase();
+const fmtDateTime = ts => new Date(ts * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
 const fmtDate = ts => ts ? new Date(ts * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'Never';
 
 /* ---------- login ---------- */
@@ -145,7 +147,7 @@ async function renderDashboard() {
     h('div', { class: 'card-body kv' },
       kv('Username', me.username), kv('Name', me.display_name || '—'), kv('Email', me.email || '—'),
       kv('Groups', me.groups.length ? me.groups.join(', ') : '—'), kv('Last sign-in', fmtDate(me.last_login)))));
-  if (me.is_admin) main.append(usersCard());
+  if (me.is_admin) main.append(usersCard(), auditCard());
   root.replaceChildren(top, main);
 }
 const kv = (k, v) => h('div', null, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v));
@@ -177,13 +179,17 @@ function usersCard() {
           u.id === state.me.id ? null : h('button', { class: 'btn sm ghost danger', title: 'Delete', 'aria-label': 'Delete ' + u.username, onclick: () => deleteDialog(u) }, icon('trash'))))))));
   }
   paint();
-  return h('section', { class: 'card' },
+  return h('section', { class: 'card', id: 'users-card' },
     h('div', { class: 'card-head' }, h('h2', null, 'Users'),
       h('div', { class: 'toolbar' }, search, h('button', { class: 'btn primary', onclick: () => userDialog(null) }, icon('plus'), 'Add user'))),
     body);
 }
 
-async function refresh() { await loadUsers(); const old = document.querySelector('main section:last-child'); old.replaceWith(usersCard()); }
+async function refresh() {
+  await loadUsers();
+  document.getElementById('users-card').replaceWith(usersCard());
+  const a = document.getElementById('audit-card'); if (a) a.reload();   // changes just made show up in the log
+}
 
 function userDialog(u) {
   const edit = !!u;
@@ -239,6 +245,79 @@ function ownPasswordDialog() {
       state.me.pw_default = false; toast('Password updated'); await renderDashboard();
     }
   });
+}
+
+/* ---------- audit log ---------- */
+const AUDIT_LABELS = {
+  'login.success': ['Signed in', 'ok'], 'login.failed': ['Login failed', 'bad'], 'login.blocked': ['Login blocked', 'bad'],
+  'logout': ['Signed out', ''], 'password.change': ['Password changed', ''], 'user.create': ['User created', ''],
+  'user.update': ['User updated', ''], 'user.delete': ['User deleted', 'bad'], 'audit.clear': ['Log cleared', 'warn']
+};
+
+function auditCard() {
+  const A = state.audit;
+  const body = h('div', { class: 'table-wrap' });
+  const pager = h('div', { class: 'pager' });
+  const sel = h('select', { 'aria-label': 'Filter events', onchange: () => { A.filter = sel.value; A.offset = 0; load(); } },
+    [['', 'All events'], ['failed', 'Failed logins'], ['login', 'Sign-ins & sign-outs'], ['user', 'User changes']]
+      .map(([v, t]) => h('option', { value: v, selected: v === A.filter }, t)));
+  const search = h('input', { type: 'search', placeholder: 'Search IP, user, details…', value: A.q, 'aria-label': 'Search audit log' });
+  let timer;
+  search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(() => { A.q = search.value; A.offset = 0; load(); }, 300); });
+
+  async function load() {
+    try {
+      const qs = new URLSearchParams({ limit: A.limit, offset: A.offset, filter: A.filter, q: A.q });
+      const d = await api('GET', API + '/audit?' + qs);
+      A.entries = d.entries; A.total = d.total;
+      if (!d.entries.length && d.total && A.offset) { A.offset = Math.floor((d.total - 1) / A.limit) * A.limit; return load(); }
+      paint();
+    } catch (e) { body.replaceChildren(h('div', { class: 'empty' }, e.message)); pager.replaceChildren(); }
+  }
+
+  function paint() {
+    if (!A.entries.length) {
+      body.replaceChildren(h('div', { class: 'empty' }, A.q || A.filter ? 'No matching entries' : 'The audit log is empty'));
+      return pager.replaceChildren();
+    }
+    body.replaceChildren(h('table', null,
+      h('thead', null, h('tr', null, ['Time', 'Event', 'User', 'Target', 'IP address', 'Details'].map(t => h('th', null, t)))),
+      h('tbody', null, A.entries.map(e => {
+        const [label, kind] = AUDIT_LABELS[e.action] || [e.action, ''];
+        return h('tr', null,
+          h('td', { class: 'muted' }, fmtDateTime(e.ts)),
+          h('td', null, h('span', { class: 'tag ' + kind }, label)),
+          h('td', null, e.actor || '—'),
+          h('td', null, e.target || '—'),
+          h('td', { class: 'mono' }, e.ip || '—'),
+          h('td', { class: 'wrap muted' }, e.detail || '—'));
+      }))));
+    const from = A.offset + 1, to = A.offset + A.entries.length;
+    pager.replaceChildren(
+      h('span', { class: 'muted' }, from + '–' + to + ' of ' + A.total),
+      h('div', { class: 'toolbar' },
+        h('button', { class: 'btn sm', disabled: A.offset === 0, onclick: () => { A.offset = Math.max(0, A.offset - A.limit); load(); } }, 'Newer'),
+        h('button', { class: 'btn sm', disabled: to >= A.total, onclick: () => { A.offset += A.limit; load(); } }, 'Older')));
+  }
+
+  function clearDialog() {
+    openDialog({
+      title: 'Clear audit log?', submit: 'Clear logs', danger: true,
+      fields: h('p', { class: 'muted' }, 'This permanently deletes all ' + A.total + ' audit entries. The clearing itself will be recorded.'),
+      onSubmit: async () => { const r = await api('DELETE', API + '/audit'); toast(r.removed + ' entries removed'); A.offset = 0; await load(); }
+    });
+  }
+
+  const sec = h('section', { class: 'card', id: 'audit-card' },
+    h('div', { class: 'card-head' },
+      h('div', null, h('h2', null, 'Audit log'), h('div', { class: 'muted small' }, 'Sign-ins, failed attempts and account changes')),
+      h('div', { class: 'toolbar' }, sel, search,
+        h('button', { class: 'btn', onclick: () => load() }, 'Refresh'),
+        h('button', { class: 'btn danger', onclick: clearDialog }, icon('trash'), 'Clear logs'))),
+    body, pager);
+  sec.reload = load;
+  load();
+  return sec;
 }
 
 /* ---------- boot ---------- */

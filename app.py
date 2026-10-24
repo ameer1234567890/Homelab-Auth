@@ -41,6 +41,8 @@ if UP_TLS:
         UP_CTX.check_hostname = False
         UP_CTX.verify_mode = ssl.CERT_NONE
 
+AUDIT_MAX_ROWS = int(env("AUDIT_MAX_ROWS", "50000"))  # oldest entries are pruned beyond this
+
 COOKIE = "hl_session"
 STRIP_COOKIES = {"hl_session", "hl_theme"}
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers",
@@ -133,6 +135,15 @@ def init_db():
           created_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+        CREATE TABLE IF NOT EXISTS audit_log(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          action TEXT NOT NULL,
+          actor TEXT NOT NULL DEFAULT '',
+          target TEXT NOT NULL DEFAULT '',
+          ip TEXT NOT NULL DEFAULT '',
+          detail TEXT NOT NULL DEFAULT '');
+        CREATE INDEX IF NOT EXISTS audit_ts ON audit_log(ts);
         """)
         cols = [r["name"] for r in con.execute("PRAGMA table_info(users)")]
         if "theme" not in cols:  # migrate databases created by earlier versions
@@ -313,6 +324,31 @@ class Handler(BaseHTTPRequestHandler):
                 "WHERE s.token_hash=? AND s.expires_at>? AND u.disabled=0", (th, int(time.time()))).fetchone()
         return (row, th) if row else (None, None)
 
+    def audit(self, action, actor="", target="", detail="", con=None):
+        """Append to the audit log. With `con`, joins the caller's transaction (caller commits)."""
+        own = con is None
+        if own:
+            con = db()
+        try:
+            cur = con.execute("INSERT INTO audit_log(ts,action,actor,target,ip,detail) VALUES(?,?,?,?,?,?)",
+                              (int(time.time()), action, clean(actor, 64), clean(target, 64),
+                               clean(self.client_ip(), 64), clean(detail, 300)))
+            if cur.lastrowid % 200 == 0:
+                con.execute("DELETE FROM audit_log WHERE id<=?", (cur.lastrowid - AUDIT_MAX_ROWS,))
+            if own:
+                con.commit()
+        finally:
+            if own:
+                con.close()
+
+    def end_session(self):
+        user, th = self.session()
+        if th:
+            with closing(db()) as con:
+                con.execute("DELETE FROM sessions WHERE token_hash=?", (th,))
+                self.audit("logout", user["username"], con=con)
+                con.commit()
+
     # --- dispatch ---
     def do_GET(self): self.route()
     def do_HEAD(self): self.route()
@@ -359,10 +395,7 @@ class Handler(BaseHTTPRequestHandler):
         if raw == "/_auth/verify" and get:
             return self.verify(q)
         if raw == "/_auth/logout" and get:
-            _, th = self.session()
-            if th:
-                with closing(db()) as con:
-                    con.execute("DELETE FROM sessions WHERE token_hash=?", (th,)); con.commit()
+            self.end_session()
             return self.respond(302, headers=[("Location", "/_auth/"), self.cookie_hdr("", 0)])
         if raw.startswith("/_auth/api/"):
             if not get and self.headers.get("X-Requested-With") != "fetch":
@@ -559,10 +592,7 @@ class Handler(BaseHTTPRequestHandler):
         if p == ["login"] and m == "POST":
             return self.login()
         if p == ["logout"] and m == "POST":
-            _, th = self.session()
-            if th:
-                with closing(db()) as con:
-                    con.execute("DELETE FROM sessions WHERE token_hash=?", (th,)); con.commit()
+            self.end_session()
             return self.json(200, {"ok": True}, [self.cookie_hdr("", 0)])
         if p == ["me"] and m in ("GET", "HEAD"):
             user, _ = self.need_user()
@@ -580,6 +610,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.change_own_password()
         if p[0] == "users":
             return self.users_api(p[1:])
+        if p[0] == "audit" and len(p) == 1:
+            return self.audit_api(q)
         raise ApiError(404, "Not found")
 
     def login(self):
@@ -588,6 +620,7 @@ class Handler(BaseHTTPRequestHandler):
         key = f"{self.client_ip()}|{username}"
         if throttled(key):
             print(f"Login blocked from {self.client_ip()} for user {username} (too many failed attempts)", flush=True)
+            self.audit("login.blocked", username, detail="too many failed attempts")
             raise ApiError(429, "Too many attempts. Try again in a minute.")
         with closing(db()) as con:
             row = con.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
@@ -595,12 +628,16 @@ class Handler(BaseHTTPRequestHandler):
             if not (row and ok and not row["disabled"]):
                 note_fail(key)
                 print(f"Login failed from {self.client_ip()} for user {username}", flush=True)
+                reason = "unknown user" if not row else ("account disabled" if ok and row["disabled"] else "wrong password")
+                self.audit("login.failed", username, detail=reason, con=con)
+                con.commit()
                 raise ApiError(401, "Invalid username or password")
             clear_fail(key)
             token, now = secrets.token_urlsafe(32), int(time.time())
             con.execute("DELETE FROM sessions WHERE expires_at<?", (now,))
             con.execute("INSERT INTO sessions VALUES(?,?,?,?)", (sha(token), row["id"], now, now + SESSION_SECONDS))
             con.execute("UPDATE users SET last_login=? WHERE id=?", (now, row["id"]))
+            self.audit("login.success", row["username"], con=con)
             con.commit()
             row = con.execute("SELECT * FROM users WHERE id=?", (row["id"],)).fetchone()
         self.json(200, {"user": user_out(row), "gateway": bool(UP),
@@ -618,8 +655,48 @@ class Handler(BaseHTTPRequestHandler):
         with closing(db()) as con:
             con.execute("UPDATE users SET password_hash=?, pw_default=0 WHERE id=?", (hash_pw(new), user["id"]))
             con.execute("DELETE FROM sessions WHERE user_id=? AND token_hash!=?", (user["id"], th))
+            self.audit("password.change", user["username"], user["username"], "own password", con=con)
             con.commit()
         self.json(200, {"ok": True})
+
+    def audit_api(self, q):
+        admin = self.need_admin()
+
+        def num(name, default, lo, hi):
+            try:
+                return min(max(int((q.get(name) or [default])[0]), lo), hi)
+            except ValueError:
+                return default
+
+        if self.command == "DELETE":
+            with closing(db()) as con:
+                n = con.execute("DELETE FROM audit_log").rowcount
+                self.audit("audit.clear", admin["username"], detail=f"{n} entries removed", con=con)
+                con.commit()
+            return self.json(200, {"ok": True, "removed": n})
+        if self.command not in ("GET", "HEAD"):
+            raise ApiError(405, "Method not allowed")
+        limit, offset = num("limit", 25, 1, 200), num("offset", 0, 0, 10**9)
+        flt, search = (q.get("filter") or [""])[0], (q.get("q") or [""])[0].strip()[:100]
+        where, args = [], []
+        if flt == "failed":
+            where.append("action IN ('login.failed','login.blocked')")
+        elif flt == "login":
+            where.append("(action LIKE 'login.%' OR action='logout')")
+        elif flt == "user":
+            where.append("(action LIKE 'user.%' OR action LIKE 'password.%')")
+        if search:
+            like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            cols = ("action", "actor", "target", "ip", "detail")
+            where.append("(" + " OR ".join(f"{c} LIKE ? ESCAPE '\\'" for c in cols) + ")")
+            args += [like] * len(cols)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        with closing(db()) as con:
+            total = con.execute(f"SELECT COUNT(*) FROM audit_log {clause}", args).fetchone()[0]
+            rows = con.execute(f"SELECT * FROM audit_log {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+                               (*args, limit, offset)).fetchall()
+        return self.json(200, {"total": total, "limit": limit, "offset": offset,
+                               "entries": [dict(r) for r in rows]})
 
     def users_api(self, p):
         admin = self.need_admin()
@@ -651,6 +728,9 @@ class Handler(BaseHTTPRequestHandler):
                     con.commit()
                 except sqlite3.IntegrityError:
                     raise ApiError(409, "That username is already taken")
+                self.audit("user.create", admin["username"], username,
+                           f"admin={'yes' if d.get('is_admin') else 'no'}, groups={groups or '-'}", con=con)
+                con.commit()
                 return self.json(201, {"ok": True})
             if len(p) == 1 and p[0].isdigit() and m in ("PATCH", "DELETE"):
                 uid = int(p[0])
@@ -661,41 +741,58 @@ class Handler(BaseHTTPRequestHandler):
                 if m == "DELETE":
                     if me:
                         raise ApiError(400, "You can't delete your own account")
-                    con.execute("DELETE FROM users WHERE id=?", (uid,)); con.commit()
+                    con.execute("DELETE FROM users WHERE id=?", (uid,))
+                    self.audit("user.delete", admin["username"], target["username"], con=con)
+                    con.commit()
                     return self.json(200, {"ok": True})
                 d = self.body()
-                sets, vals, kill_sessions = [], [], False
+                sets, vals, kill_sessions, changed = [], [], False, []
                 if "display_name" in d:
-                    sets.append("display_name=?"); vals.append(clean(d["display_name"], 64))
+                    v = clean(d["display_name"], 64)
+                    sets.append("display_name=?"); vals.append(v)
+                    if v != target["display_name"]:
+                        changed.append("display_name")
                 if "email" in d:
                     email = clean(d["email"], 254)
                     if email and not EMAIL_RE.match(email):
                         raise ApiError(400, "Invalid email address")
                     sets.append("email=?"); vals.append(email)
+                    if email != target["email"]:
+                        changed.append("email")
                 if "groups" in d:
                     try:
-                        sets.append("groups=?"); vals.append(parse_groups(d["groups"]))
+                        g = parse_groups(d["groups"])
+                        sets.append("groups=?"); vals.append(g)
+                        if g != target["groups"]:
+                            changed.append("groups")
                     except ValueError as e:
                         raise ApiError(400, str(e))
                 if "is_admin" in d:
                     if me and not d["is_admin"]:
                         raise ApiError(400, "You can't remove your own admin rights")
                     sets.append("is_admin=?"); vals.append(1 if d["is_admin"] else 0)
+                    if bool(d["is_admin"]) != bool(target["is_admin"]):
+                        changed.append("is_admin=" + ("yes" if d["is_admin"] else "no"))
                 if "disabled" in d:
                     if me and d["disabled"]:
                         raise ApiError(400, "You can't disable your own account")
                     sets.append("disabled=?"); vals.append(1 if d["disabled"] else 0)
+                    if bool(d["disabled"]) != bool(target["disabled"]):
+                        changed.append("disabled=" + ("yes" if d["disabled"] else "no"))
                     kill_sessions = kill_sessions or bool(d["disabled"])
                 if d.get("password"):
                     pw = str(d["password"])
                     if len(pw) < MIN_PW or len(pw) > 256:
                         raise ApiError(400, f"Password must be at least {MIN_PW} characters")
                     sets += ["password_hash=?", "pw_default=0"]; vals.append(hash_pw(pw))
+                    changed.append("password")
                     kill_sessions = kill_sessions or not me
                 if sets:
                     con.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", (*vals, uid))
                 if kill_sessions:
                     con.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+                if changed:
+                    self.audit("user.update", admin["username"], target["username"], "changed: " + ", ".join(changed), con=con)
                 con.commit()
                 return self.json(200, {"ok": True})
         raise ApiError(404, "Not found")
