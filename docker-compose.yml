@@ -1,0 +1,42 @@
+name: homelab-auth
+
+services:
+  auth:
+    build: .
+    image: homelab-auth:latest
+    container_name: homelab-auth
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      # >>> The internal app to protect (service name + container port from this compose network).
+      UPSTREAM_URL: ${UPSTREAM_URL:-http://app:80}
+      # Upstream tuning (optional)
+      PRESERVE_HOST: ${PRESERVE_HOST:-true}              # forward the browser's Host header (false = use upstream's)
+      UPSTREAM_INSECURE_TLS: ${UPSTREAM_INSECURE_TLS:-false}  # true to accept self-signed https upstreams
+      UPSTREAM_TIMEOUT: ${UPSTREAM_TIMEOUT:-600}
+
+      # First-run admin (only used when the database is empty).
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-password123}
+
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}   # set true once served over HTTPS
+      SESSION_HOURS: ${SESSION_HOURS:-168}
+      TRUST_PROXY: ${TRUST_PROXY:-false}       # true if another reverse proxy sits in front of this
+      # Only needed for the optional forward-auth mode (see README):
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+    volumes:
+      - data:/data
+    depends_on:
+      - app
+
+  # Example protected app. Replace with your own. Note: NO "ports:" -> not exposed to the host.
+  app:
+    image: traefik/whoami      # prints the request headers it receives; handy for testing
+    restart: unless-stopped
+    expose:
+      - "80"
+
+volumes:
+  data:
