@@ -587,12 +587,14 @@ class Handler(BaseHTTPRequestHandler):
         username, password = clean(d.get("username"), 64).lower(), str(d.get("password") or "")[:256]
         key = f"{self.client_ip()}|{username}"
         if throttled(key):
+            print(f"Login blocked from {self.client_ip()} for user {username} (too many failed attempts)", flush=True)
             raise ApiError(429, "Too many attempts. Try again in a minute.")
         with closing(db()) as con:
             row = con.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
             ok = check_pw(password, row["password_hash"] if row else DUMMY_HASH)
             if not (row and ok and not row["disabled"]):
                 note_fail(key)
+                print(f"Login failed from {self.client_ip()} for user {username}", flush=True)
                 raise ApiError(401, "Invalid username or password")
             clear_fail(key)
             token, now = secrets.token_urlsafe(32), int(time.time())
