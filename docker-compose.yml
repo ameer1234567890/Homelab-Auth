@@ -2,8 +2,7 @@ name: homelab-auth
 
 services:
   auth:
-    build: .
-    image: homelab-auth:latest
+    image: ameer1234567890/homelab-auth:latest
     container_name: homelab-auth
     restart: unless-stopped
     ports:
